@@ -13,7 +13,9 @@ class PENMAN():
             This is a simple evapotranspiration model (Penman)
             Args:
                 self (class): This is the model class
-                e (dictionary): This has all the information to run the model.
+                p (dictionary): This has all the information to run the model.
+                    All the parameters are set in the configuration file,
+                    The temperature comes from some forcing set by a BMI
             Returns:
                 Nothing, just updates the values in the e
         """
