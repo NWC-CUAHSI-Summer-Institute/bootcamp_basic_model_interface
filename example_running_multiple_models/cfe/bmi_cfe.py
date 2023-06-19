@@ -5,8 +5,9 @@ import sys
 import json
 import matplotlib.pyplot as plt
 import cfe
+from bmi import Bmi
 
-class BMI_CFE():
+class BMI_CFE(Bmi):
     def __init__(self):
         """Create a Bmi CFE model that is ready for initialization."""
         super(BMI_CFE, self).__init__()

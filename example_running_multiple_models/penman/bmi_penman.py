@@ -5,8 +5,9 @@ import sys
 import json
 import matplotlib.pyplot as plt
 import penman
+from bmi import Bmi
 
-class BMI_PENMAN():
+class BMI_PENMAN(Bmi):
     def __init__(self):
         """Create a Bmi EVAPORATION model that is ready for initialization."""
         super(BMI_PENMAN, self).__init__()

@@ -4,8 +4,9 @@ import pandas as pd
 import sys
 import json
 import bucket
+from bmi import Bmi
 
-class BMI_BUCKET():
+class BMI_BUCKET(Bmi):
     def __init__(self):
         """Create a Bmi BUCKET model that is ready for initialization."""
         super(BMI_BUCKET, self).__init__()
