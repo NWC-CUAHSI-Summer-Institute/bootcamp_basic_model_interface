@@ -1,3 +1,6 @@
+# This code is out of data, please see following link for up-to-date code:
+[https://github.com/NWC-CUAHSI-Summer-Institute/python_cfe](https://github.com/NWC-CUAHSI-Summer-Institute/python_cfe)
+
 # Python version of the NWM Conceptual Functional Equivalent (CFE) model
 
 This directory contains a Python version of the same CFE model as written in C contained in the `../src/` directory. This version is intended for learning and quick prototyping model development, but should also be fully functional within the Nextgen Framework.
