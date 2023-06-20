@@ -1,5 +1,5 @@
 {
-    "forcing_file":"../forcing/cat58_01Dec2015.csv",
+    "forcing_file":"./forcing/cat58_01Dec2015.csv",
     "catchment_area_km2":15.617167355002097,
     "alpha_fc":0.33,
     "soil_params":{
@@ -24,5 +24,5 @@
     "giuh_ordinates":[0.1,0.35,0.2,0.14,0.1,0.06,0.05],
     "stand_alone":1,
     "unit_test":1,
-    "compare_results_file":"./test_compare.csv"
+    "compare_results_file":"./cfe/test_compare.csv"
 }

@@ -3,42 +3,52 @@ import numpy as np
 import pandas as pd
 import sys
 import json
-import bucket
+import matplotlib.pyplot as plt
+import cfe
 from bmi import Bmi
 
-class BMI_BUCKET(Bmi):
+class BMI_CFE(Bmi):
     def __init__(self):
-        """Create a Bmi BUCKET model that is ready for initialization."""
-        super(BMI_BUCKET, self).__init__()
+        """Create a Bmi CFE model that is ready for initialization."""
+        super(BMI_CFE, self).__init__()
         self._values = {}
         self._var_loc = "node"
         self._var_grid_id = 0
         self._start_time = 0.0
         self._end_time = np.finfo("d").max
         
+        # these need to be initialized here as scale_output() called in update()
+        self.streamflow_cms = 0.0
+        self.streamflow_fms = 0.0
+        self.surface_runoff_m = 0.0
+
         #----------------------------------------------
         # Required, static attributes of the model
         #----------------------------------------------
         self._att_map = {
-            'model_name':         'Bucket with a hole in it',
+            'model_name':         'Conceptual Functional Equivalent (CFE)',
             'version':            '1.0',
             'author_name':        'Jonathan Martin Frame',
             'grid_type':          'scalar',
-            'time_units':         '1 second' }
+            'time_step_size':      1, 
+            'time_units':         '1 hour' }
     
         #---------------------------------------------
         # Input variable names (CSDMS standard names)
         #---------------------------------------------
         self._input_var_names = [
-            'water__input_volume_flux',
+            'atmosphere_water__time_integral_of_precipitation_mass_flux',
             'water_potential_evaporation_flux']
     
         #---------------------------------------------
         # Output variable names (CSDMS standard names)
         #---------------------------------------------
-        self._output_var_names = ['bucket__overflow', 
-                                  'bucket__outlet',
-                                  'bucket__water_surface_elevation']
+        self._output_var_names = ['land_surface_water__runoff_depth', 
+                                  'land_surface_water__runoff_volume_flux',
+                                  "DIRECT_RUNOFF",
+                                  "GIUH_RUNOFF",
+                                  "NASH_LATERAL_RUNOFF",
+                                  "DEEP_GW_TO_CHANNEL_FLUX"]
         
         #------------------------------------------------------
         # Create a Python dictionary that maps CSDMS Standard
@@ -47,18 +57,22 @@ class BMI_BUCKET(Bmi):
         #     since the input variable names could come from any forcing...
         #------------------------------------------------------
         self._var_name_units_map = {
-                                'bucket__overflow':['bucket_overflow','m3'],
-                                'bucket__outlet':['bucket_outlet','m3'],
-                                'bucket__water_surface_elevation':['water_level_m','m'],
+                                'land_surface_water__runoff_volume_flux':['streamflow_cfs','ft3 s-1'],
+                                'land_surface_water__runoff_depth':['total_discharge','m'],
                                 #--------------   Dynamic inputs --------------------------------
-                                'water__input_volume_flux':['input_mm','kg m-2'],
+                                'atmosphere_water__time_integral_of_precipitation_mass_flux':['timestep_rainfall_input_m','kg m-2'],
                                 'water_potential_evaporation_flux':['potential_et_m_per_s','m s-1'],
+                                'DIRECT_RUNOFF':['surface_runoff_depth_m','m'],
+                                'GIUH_RUNOFF':['flux_giuh_runoff_m','m'],
+                                'NASH_LATERAL_RUNOFF':['flux_nash_lateral_runoff_m','m'],
+                                'DEEP_GW_TO_CHANNEL_FLUX':['flux_from_deep_gw_to_chan_m','m']
                           }
 
     #__________________________________________________________________
     #__________________________________________________________________
     # BMI: Model Control Function
-    def initialize(self, cfg_file=None, current_time_step=0):
+    def initialize(self,cfg_file=None, current_time_step=0):
+
         #------------------------------------------------------------
         # this is the bmi configuration file
         self.cfg_file = cfg_file
@@ -67,9 +81,7 @@ class BMI_BUCKET(Bmi):
 
         # ----- Create some lookup tabels from the long variable names --------#
         self._var_name_map_long_first = {long_name:self._var_name_units_map[long_name][0] for long_name in self._var_name_units_map.keys()}
-        
         self._var_name_map_short_first = {self._var_name_units_map[long_name][0]:long_name for long_name in self._var_name_units_map.keys()}
-        
         self._var_units_map = {long_name:self._var_name_units_map[long_name][1] for long_name in self._var_name_units_map.keys()}
         
         # -------------- Initalize all the variables --------------------------# 
@@ -86,38 +98,138 @@ class BMI_BUCKET(Bmi):
         self.config_from_json()                                    #
         
         # ________________________________________________
+        # The configuration should let the BMI know what mode to run in (framework vs standalone)
+        # If it is stand alone, then load in the forcing and read the time from the forcig file
+        if self.stand_alone == 1:
+            self.load_forcing_file()
+            self.current_time = pd.Timestamp(self.forcing_data['time'][self.current_time_step])
+
+        # ________________________________________________
+        # In order to check mass conservation at any time
+        self.reset_volume_tracking()
+        
+        # ________________________________________________
+        # initialize simulation constants
+        atm_press_Pa=101325.0
+        unit_weight_water_N_per_m3=9810.0
+        
+        # ________________________________________________
         # Time control
+        self.time_step_size = 3600
         self.timestep_h = self.time_step_size / 3600.0
         self.timestep_d = self.timestep_h / 24.0
         self.current_time_step = 0
-        self.current_time = self.current_time_step
+        self.current_time = pd.Timestamp(year=1970, month=1, day=1, hour=0)
         
-        self.g = 9.81
-
-        # ________________________________________________
-        # Initial value
-        self.water_level_m = self.outlet_elevation_m
-
         # ________________________________________________
         # Inputs
-        self.input_mm = 0
-        self.outlet_m = 0
+        self.timestep_rainfall_input_m = 0
         self.potential_et_m_per_s      = 0
+        
+        # ________________________________________________
+        # calculated flux variables
+        self.flux_overland_m                = 0 # surface runoff that goes through the GIUH convolution process
+        self.flux_perc_m                    = 0 # flux from soil to deeper groundwater reservoir
+        self.flux_lat_m                     = 0 # lateral flux in the subsurface to the Nash cascade
+        self.flux_from_deep_gw_to_chan_m    = 0 # flux from the deep reservoir into the channels
+        self.gw_reservoir_storage_deficit_m = 0 # the available space in the conceptual groundwater reservoir
+        self.primary_flux                   = 0 # temporary vars.
+        self.secondary_flux                 = 0 # temporary vars.
+        self.total_discharge                = 0
         
         # ________________________________________________
         # Evapotranspiration
         self.potential_et_m_per_timestep = 0
         self.actual_et_m_per_timestep    = 0
          
-        # ________________________________________________
-        # In order to check mass conservation at any time
-        self.reset_total_volume_tracking()
+        # ________________________________________________________
+        # Set these values now that we have the information from the configuration file.
+        self.runoff_queue_m_per_timestep = np.zeros(len(self.giuh_ordinates))
+        self.num_giuh_ordinates = len(self.runoff_queue_m_per_timestep)
+        self.num_lateral_flow_nash_reservoirs = self.nash_storage.shape[0]
         
+        # ________________________________________________
+        # Local values to be used in setting up soil reservoir
+        trigger_z_m = 0.5
+        
+        field_capacity_atm_press_fraction = 0.33
+        
+        H_water_table_m=field_capacity_atm_press_fraction * atm_press_Pa / unit_weight_water_N_per_m3 
+        
+        soil_water_content_at_field_capacity = self.soil_params['smcmax'] * \
+                                     np.power(H_water_table_m/self.soil_params['satpsi'],(1.0/self.soil_params['bb']))
+        
+        Omega     = H_water_table_m - trigger_z_m
+        
+        lower_lim = np.power(Omega , (1.0-1.0/self.soil_params['bb']))/(1.0-1.0/self.soil_params['bb']);
+        
+        upper_lim = np.power(Omega+self.soil_params['D'],(1.0-1.0/self.soil_params['bb']))/(1.0-1.0/self.soil_params['bb'])
+
+        storage_thresh_pow_term = np.power(1.0/self.soil_params['satpsi'],(-1.0/self.soil_params['bb']))
+
+        lim_diff = (upper_lim-lower_lim)
+
+        field_capacity_power = np.power(1.0/self.soil_params['satpsi'],(-1.0/self.soil_params['bb']))
+
+        field_capacity_storage_threshold_m = self.soil_params['smcmax'] * field_capacity_power * lim_diff
+        
+        # ________________________________________________
+        # lateral flow function parameters
+        assumed_near_channel_water_table_slope = 0.01 # [L/L]
+        lateral_flow_threshold_storage_m       = field_capacity_storage_threshold_m
+#         lateral_flow_linear_reservoir_constant = 2.0 * assumed_near_channel_water_table_slope * \     # Not used
+#                                                  self.soil_params['mult'] * NWM_soil_params.satdk * \ # Not used
+#                                                  self.soil_params['D'] * drainage_density_km_per_km2  # Not used
+#         lateral_flow_linear_reservoir_constant *= 3600.0                                              # Not used
+        self.soil_reservoir_storage_deficit_m  = 0
+
+        # ________________________________________________
+        # Subsurface reservoirs
+        self.gw_reservoir = {'is_exponential':True,
+                              'storage_max_m':1.0,
+                              'coeff_primary':0.01,
+                              'exponent_primary':6.0,
+                              'storage_threshold_primary_m':0.0,
+                              'storage_threshold_secondary_m':0.0,
+                              'coeff_secondary':0.0,
+                              'exponent_secondary':1.0}
+        self.gw_reservoir['storage_m'] = self.gw_reservoir['storage_max_m'] * 0.01
+        self.volstart                 += self.gw_reservoir['storage_m']
+        self.vol_in_gw_start           = self.gw_reservoir['storage_m']
+
+        self.soil_reservoir = {'is_exponential':False,
+                               'storage_max_m':self.soil_params['smcmax'] * self.soil_params['D'],
+                               'coeff_primary':self.soil_params['satdk'] * self.soil_params['slop'] * 3600.0,
+                               'exponent_primary':1.0,
+                               'storage_threshold_primary_m':self.soil_params['smcmax'] * storage_thresh_pow_term*
+                                                             (upper_lim-lower_lim),
+                               'coeff_secondary':0.01,
+                               'exponent_secondary':1.0,
+                               'storage_threshold_secondary_m':lateral_flow_threshold_storage_m}
+        self.soil_reservoir['storage_m'] = self.soil_reservoir['storage_max_m'] * 0.667
+        self.volstart                   += self.soil_reservoir['storage_m']
+        self.vol_soil_start              = self.soil_reservoir['storage_m']
+        
+        # ________________________________________________
+        # Schaake
+        self.refkdt = 3.0
+        self.Schaake_adjusted_magic_constant_by_soil_type = self.refkdt * self.soil_params['satdk'] / 2.0e-06
+        self.Schaake_output_runoff_m = 0
+        self.infiltration_depth_m = 0
+        
+        # ________________________________________________
+        # Nash cascade        
+        self.K_nash = 0.03
+
+        # ----------- The output is area normalized, this is needed to un-normalize it
+        #                         mm->m                             km2 -> m2          hour->s    
+        self.output_factor_cms =  (1/1000) * (self.catchment_area_km2 * 1000*1000) * (1/3600)
+
         ####################################################################
         # ________________________________________________________________ #
         # ________________________________________________________________ #
-        # CREATE AN INSTANCE OF THE SIMPLE BUCKET MODEL #
-        self.bucket_model = bucket.BUCKET()
+        # CREATE AN INSTANCE OF THE CONCEPTUAL FUNCTIONAL EQUIVALENT MODEL #
+        self.cfe_model = cfe.CFE()
         # ________________________________________________________________ #
         # ________________________________________________________________ #
         ####################################################################
@@ -127,22 +239,19 @@ class BMI_BUCKET(Bmi):
     # __________________________________________________________________________________________________________
     # BMI: Model Control Function
     def update(self):
-        self.bucket_model.run_bucket(self)
+        self.cfe_model.run_cfe(self)
         self.scale_output()
 
     # __________________________________________________________________________________________________________
     # __________________________________________________________________________________________________________
     # BMI: Model Control Function
-    def update_until(self, until):
-        for i in range(self.current_time_step, until, self.time_step_size):
-            self.bucket_model.run_bucket(self)
+    def update_until(self, until, verbose=True):
+        for i in range(self.current_time_step, until):
+            self.cfe_model.run_cfe(self)
             self.scale_output()
-            self.current_time += self.time_step_size
-
-            if self.current_time >= until:
-                break
-        
-        self.current_time_step = self.current_time
+            if verbose:
+                print("total discharge: {}".format(self.total_discharge))
+                print("at time: {}".format(self.current_time))
         
     # __________________________________________________________________________________________________________
     # __________________________________________________________________________________________________________
@@ -150,21 +259,35 @@ class BMI_BUCKET(Bmi):
     def finalize(self,print_mass_balance=False):
 
         self.finalize_mass_balance(verbose=print_mass_balance)
-        self.reset_total_volume_tracking()
+        self.reset_volume_tracking()
 
         """Finalize model."""
-        self.bucket_model = None
-        self.bucket_state = None
+        self.cfe_model = None
+        self.cfe_state = None
     
     # ________________________________________________
     # Mass balance tracking
-    def reset_total_volume_tracking(self):
-        self.total_start             = self.water_level_m
-        self.total_in                = 0
-        self.total_end               = 0
-        self.total_lost              = 0
-        self.total_overflow          = 0
-        self.total_outlet            = 0
+    def reset_volume_tracking(self):
+        self.volstart             = 0
+        self.vol_sch_runoff       = 0
+        self.vol_sch_infilt       = 0
+        self.vol_out_giuh         = 0
+        self.vol_end_giuh         = 0
+        self.vol_to_gw            = 0
+        self.vol_to_gw_start      = 0
+        self.vol_to_gw_end        = 0
+        self.vol_from_gw          = 0
+        self.vol_in_nash          = 0
+        self.vol_in_nash_end      = 0
+        self.vol_out_nash         = 0
+        self.vol_soil_start       = 0
+        self.vol_to_soil          = 0
+        self.vol_soil_to_lat_flow = 0
+        self.vol_soil_to_gw       = 0
+        self.vol_soil_end         = 0
+        self.volin                = 0
+        self.volout               = 0
+        self.volend               = 0
         return
     
     #________________________________________________________
@@ -174,15 +297,28 @@ class BMI_BUCKET(Bmi):
 
         # ___________________________________________________
         # MANDATORY CONFIGURATIONS
-        self.forcing_file                  = data_loaded['forcing_file']
-        self.time_step_size                = data_loaded['time_step_size_seconds']
-        self._att_map['time_step_size']    = self.time_step_size
-        self.bucket_top_area_m2            = data_loaded['surface_area_m2']
-        self.outlet_cross_area_m2          = data_loaded['outlet_cross_area_m2']
-        self.outlet_elevation_m            = data_loaded['outlet_elevation_m']
-        self.max_water_surface_elevation_m = data_loaded['max_water_surface_elevation_m']
-        self.latitude                      = data_loaded['latitude']
-        self.discharge_coefficient         = data_loaded['discharge_coefficient']
+        self.forcing_file               = data_loaded['forcing_file']
+        self.catchment_area_km2         = data_loaded['catchment_area_km2']
+        self.alpha_fc                   = data_loaded['alpha_fc']
+        self.soil_params                = {}
+        self.soil_params['bb']          = data_loaded['soil_params']['bb']
+        self.soil_params['D']           = data_loaded['soil_params']['D']
+        self.soil_params['depth']       = data_loaded['soil_params']['depth']
+        self.soil_params['mult']        = data_loaded['soil_params']['mult']
+        self.soil_params['satdk']       = data_loaded['soil_params']['satdk']
+        self.soil_params['satpsi']      = data_loaded['soil_params']['satpsi']
+        self.soil_params['slop']        = data_loaded['soil_params']['slop']
+        self.soil_params['smcmax']      = data_loaded['soil_params']['smcmax']
+        self.soil_params['wltsmc']      = data_loaded['soil_params']['wltsmc']
+        self.max_gw_storage             = data_loaded['max_gw_storage']
+        self.Cgw                        = data_loaded['Cgw']
+        self.expon                      = data_loaded['expon']
+        self.gw_storage                 = data_loaded['gw_storage']
+        self.soil_storage               = data_loaded['soil_storage']
+        self.K_lf                       = data_loaded['K_lf']
+        self.K_nash                     = data_loaded['K_nash']
+        self.nash_storage               = np.array(data_loaded['nash_storage'])
+        self.giuh_ordinates             = np.array(data_loaded['giuh_ordinates'])
 
         # ___________________________________________________
         # OPTIONAL CONFIGURATIONS
@@ -191,6 +327,9 @@ class BMI_BUCKET(Bmi):
         if 'forcing_file' in data_loaded.keys():
             self.reads_own_forcing              = True
             self.forcing_file                   = data_loaded['forcing_file']
+        if 'unit_test' in data_loaded.keys():
+            self.unit_test                      = data_loaded['unit_test']
+            self.compare_results_file           = data_loaded['compare_results_file']
          
         return
 
@@ -198,18 +337,65 @@ class BMI_BUCKET(Bmi):
     #________________________________________________________        
     def finalize_mass_balance(self, verbose=True):
         
-        self.total_end        = self.water_level_m
-        self.global_residual =  (self.total_start + self.total_in) - self.total_end - self.total_lost - self.total_overflow - self.total_outlet
+        self.volend        = self.soil_reservoir['storage_m'] + self.gw_reservoir['storage_m']
+        self.vol_in_gw_end = self.gw_reservoir['storage_m']
         
+        # the GIUH queue might have water in it at the end of the simulation, so sum it up.
+        self.vol_end_giuh = np.sum(self.runoff_queue_m_per_timestep)
+        self.vol_in_nash_end = np.sum(self.nash_storage)
+
+        self.vol_soil_end = self.soil_reservoir['storage_m']
+        
+        self.global_residual  = self.volstart + self.volin - self.volout - self.volend -self.vol_end_giuh
+        self.schaake_residual = self.volin - self.vol_sch_runoff - self.vol_sch_infilt
+        self.giuh_residual    = self.vol_sch_runoff - self.vol_out_giuh - self.vol_end_giuh
+        self.soil_residual    = self.vol_soil_start + self.vol_sch_infilt - \
+                                self.vol_soil_to_lat_flow - self.vol_soil_end - self.vol_to_gw
+        self.nash_residual    = self.vol_in_nash - self.vol_out_nash - self.vol_in_nash_end
+        self.gw_residual      = self.vol_in_gw_start + self.vol_to_gw - self.vol_from_gw - self.vol_in_gw_end
         if verbose:            
-            print("\nMASS BALANCE")
-            print("  initial: {:8.4f}".format(self.total_start))
-            print("  input: {:8.4f}".format(self.total_in))
-            print("  final: {:8.4f}".format(self.total_end))
-            print("  lost: {:8.4f}".format(self.total_lost))
-            print("  overflow: {:8.4f}".format(self.total_overflow))
-            print("  outlet: {:8.4f}".format(self.total_outlet))
-            print("  residual: {:6.4e}".format(self.global_residual))
+            print("\nGLOBAL MASS BALANCE")
+            print("  initial volume: {:8.4f}".format(self.volstart))
+            print("    volume input: {:8.4f}".format(self.volin))
+            print("   volume output: {:8.4f}".format(self.volout))
+            print("    final volume: {:8.4f}".format(self.volend))
+            print("        residual: {:6.4e}".format(self.global_residual))
+
+
+            print("\nSCHAAKE MASS BALANCE")
+            print("  surface runoff: {:8.4f}".format(self.vol_sch_runoff))
+            print("    infiltration: {:8.4f}".format(self.vol_sch_infilt))
+            print("schaake residual: {:6.4e}".format(self.schaake_residual))  
+
+            print("\nGIUH MASS BALANCE");
+            print("  vol. into giuh: {:8.4f}".format(self.vol_sch_runoff))
+            print("   vol. out giuh: {:8.4f}".format(self.vol_out_giuh))
+            print(" vol. end giuh q: {:8.4f}".format(self.vol_end_giuh))
+            print("   giuh residual: {:6.4e}".format(self.giuh_residual))
+
+            print("\nSOIL WATER CONCEPTUAL RESERVOIR MASS BALANCE")
+            print("   init soil vol: {:8.4f}".format(self.vol_soil_start))     
+            print("  vol. into soil: {:8.4f}".format(self.vol_sch_infilt))
+            print("vol.soil2latflow: {:8.4f}".format(self.vol_soil_to_lat_flow))
+            print(" vol. soil to gw: {:8.4f}".format(self.vol_soil_to_gw))
+            print(" final vol. soil: {:8.4f}".format(self.vol_soil_end))   
+            print("vol. soil resid.: {:6.4e}".format(self.soil_residual))
+
+
+            print("\nNASH CASCADE CONCEPTUAL RESERVOIR MASS BALANCE")
+            print("    vol. to nash: {:8.4f}".format(self.vol_in_nash))
+            print("  vol. from nash: {:8.4f}".format(self.vol_out_nash))
+            print(" final vol. nash: {:8.4f}".format(self.vol_in_nash_end))
+            print("nash casc resid.: {:6.4e}".format(self.nash_residual))
+
+
+            print("\nGROUNDWATER CONCEPTUAL RESERVOIR MASS BALANCE")
+            print("init gw. storage: {:8.4f}".format(self.vol_in_gw_start))
+            print("       vol to gw: {:8.4f}".format(self.vol_to_gw))
+            print("     vol from gw: {:8.4f}".format(self.vol_from_gw))
+            print("final gw.storage: {:8.4f}".format(self.vol_in_gw_end))
+            print("    gw. residual: {:6.4e}".format(self.gw_residual))
+
             
         return
     
@@ -217,15 +403,63 @@ class BMI_BUCKET(Bmi):
     def load_forcing_file(self):
         self.forcing_data = pd.read_csv(self.forcing_file)
         
+    #________________________________________________________ 
+    def load_unit_test_data(self):
+        self.unit_test_data = pd.read_csv(self.compare_results_file)
+        self.cfe_output_data = pd.DataFrame().reindex_like(self.unit_test_data)
+        
+    #________________________________________________________ 
+    def run_unit_test(self, plot_lims=list(range(490, 550)), plot=False, print_fluxes=True):
+        
+        self.load_forcing_file()
+        self.load_unit_test_data()
+        
+        self.current_time = pd.Timestamp(self.forcing_data['time'][0])
+        
+        for t, precipitation_input in enumerate(self.forcing_data['precip_rate']*3600):
+            
+            self.timestep_rainfall_input_m          = precipitation_input
+            self.cfe_output_data.loc[t,'Time']      = self.current_time
+            self.cfe_output_data.loc[t,'Time Step'] = self.current_time_step
+            self.cfe_output_data.loc[t,'Rainfall']  = self.timestep_rainfall_input_m
+
+            self.cfe_model.run_cfe(self)
+            
+            self.cfe_output_data.loc[t,'Direct Runoff']   = self.surface_runoff_depth_m
+            self.cfe_output_data.loc[t,'GIUH Runoff']     = self.flux_giuh_runoff_m
+            self.cfe_output_data.loc[t,'Lateral Flow']    = self.flux_nash_lateral_runoff_m
+            self.cfe_output_data.loc[t,'Base Flow']       = self.flux_from_deep_gw_to_chan_m
+            self.cfe_output_data.loc[t,'Total Discharge'] = self.flux_Qout_m
+            self.cfe_output_data.loc[t,'Flow']            = self.total_discharge
+            
+            if print_fluxes:
+                print('{},{:.8f},{:.8f},{:.8f},{:.8f},{:.8f},{:.8f},{:.8f},'.format(self.current_time, self.timestep_rainfall_input_m,
+                                           self.surface_runoff_depth_m, self.flux_giuh_runoff_m, self.flux_nash_lateral_runoff_m,
+                                           self.flux_from_deep_gw_to_chan_m, self.flux_Qout_m, self.total_discharge))
+        
+        if plot: 
+            for output_type in ['Direct Runoff', 'GIUH Runoff', 'Lateral Flow', 'Base Flow', 'Total Discharge', 'Flow']:
+                plt.plot(self.cfe_output_data['Rainfall'][plot_lims], label='precipitation', c='gray', lw=.3)
+                plt.plot(self.cfe_output_data[output_type][plot_lims], label='cfe '+output_type)
+                plt.plot(self.unit_test_data[output_type][plot_lims], '--', label='t-shirt '+output_type)
+                plt.legend()
+                plt.show()
+                plt.close()
+    
+    
     #------------------------------------------------------------ 
     def scale_output(self):
             
-        """ The output is area normalized, this is needed to un-normalize it.
-            Converts the model outputs
-        """
-        self._values['bucket__overflow']    = self.overflow_m3
-        self._values['bucket__outlet']      = self.outlet_m3
-        self._values['bucket__water_surface_elevation'] = self.water_level_m 
+        self.surface_runoff_m = self.total_discharge
+        self._values['land_surface_water__runoff_depth'] = self.surface_runoff_m/1000
+        self.streamflow_cms = self._values['land_surface_water__runoff_depth'] * self.output_factor_cms
+
+        self._values['land_surface_water__runoff_volume_flux'] = self.streamflow_cms * (1/35.314)
+
+        self._values["DIRECT_RUNOFF"] = self.surface_runoff_depth_m
+        self._values["GIUH_RUNOFF"] = self.flux_giuh_runoff_m
+        self._values["NASH_LATERAL_RUNOFF"] = self.flux_nash_lateral_runoff_m
+        self._values["DEEP_GW_TO_CHANNEL_FLUX"] = self.flux_from_deep_gw_to_chan_m
 
     #---------------------------------------------------------------------------- 
     def initialize_forcings(self):

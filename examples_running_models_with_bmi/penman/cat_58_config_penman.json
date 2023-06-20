@@ -1,0 +1,9 @@
+{
+    "forcing_file":"../forcing/cat58_01Dec2015.csv",
+    "T_m":13.9,
+    "T_d":10,
+    "A":35,
+    "R":10,
+    "R_ann":25,
+    "h":100
+}
